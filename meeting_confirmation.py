@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Simple Meeting Confirmation Handler
-Sends confirmation messages when meetings are booked via Brevo webhooks
+Webhook Service for Brevo Meeting Confirmations
+Handles webhook processing and sends confirmation messages
+Reminder scheduling is handled by separate reminder_scheduler.py
 """
 
 from flask import Flask, request, jsonify
@@ -10,8 +11,6 @@ import logging
 import json
 from datetime import datetime, timedelta
 import hashlib
-import threading
-import time
 import os
 
 # Import configuration
@@ -48,200 +47,7 @@ def init_reminders_file():
 # Initialize reminders file
 init_reminders_file()
 
-# Reminder scheduler class
-class ReminderScheduler:
-    def __init__(self):
-        self.is_running = False
-        self.scheduler_thread = None
-        logger.info("Reminder Scheduler initialized")
-    
-    def start_scheduler(self):
-        """Start the reminder scheduler in background"""
-        if not self.is_running:
-            self.is_running = True
-            self.scheduler_thread = threading.Thread(target=self._reminder_loop)
-            self.scheduler_thread.daemon = True
-            self.scheduler_thread.start()
-            logger.info("Reminder scheduler started")
-    
-    def stop_scheduler(self):
-        """Stop the reminder scheduler"""
-        self.is_running = False
-        logger.info("Reminder scheduler stopped")
-    
-    def _reminder_loop(self):
-        """Main loop for checking and sending reminders"""
-        logger.info("Reminder scheduler loop started")
-        
-        while self.is_running:
-            try:
-                self._check_and_send_reminders()
-                time.sleep(60)  # Check every minute
-            except Exception as e:
-                logger.error(f"Error in reminder loop: {str(e)}")
-                time.sleep(60)
-        
-        logger.info("Reminder scheduler loop stopped")
-    
-    def _check_and_send_reminders(self):
-        """Check for reminders that need to be sent"""
-        try:
-            # Load reminders from JSON file
-            reminders = self._load_reminders()
-            
-            if not reminders:
-                return
-            
-            current_time = datetime.now()
-            reminders_to_send = []
-            
-            # Find reminders that should be sent now (1 hour 20 minutes before meeting)
-            for reminder in reminders:
-                if reminder.get('reminder_sent', False):
-                    continue
-                
-                meeting_datetime_str = reminder.get('meeting_datetime')
-                if not meeting_datetime_str:
-                    continue
-                
-                try:
-                    meeting_datetime = datetime.fromisoformat(meeting_datetime_str)
-                    reminder_time = meeting_datetime - timedelta(hours=1, minutes=00)
-                    
-                    # Check if it's time to send reminder (within 30-minute window for overdue reminders)
-                    time_diff = abs((current_time - reminder_time).total_seconds())
-                    
-                    # Send reminder if:
-                    # 1. Within 1 minute of reminder time (normal case), OR
-                    # 2. Past reminder time but within 30 minutes (overdue case)
-                    if time_diff <= 60 or (current_time >= reminder_time and time_diff <= 1800):
-                        reminders_to_send.append(reminder)
-                        if time_diff > 60:
-                            logger.info(f"Sending overdue reminder for {reminder.get('name', 'Unknown')} - {time_diff/60:.1f} minutes past reminder time")
-                        
-                except Exception as e:
-                    logger.error(f"Error parsing meeting datetime {meeting_datetime_str}: {str(e)}")
-                    continue
-            
-            # Send reminders
-            for reminder in reminders_to_send:
-                success = self._send_reminder_message(
-                    reminder['phone'],
-                    reminder['name'],
-                    datetime.fromisoformat(reminder['meeting_datetime']),
-                    reminder['meeting_link']
-                )
-                
-                if success:
-                    # Mark as sent
-                    reminder['reminder_sent'] = True
-                    reminder['reminder_sent_at'] = current_time.isoformat()
-                    logger.info(f"Reminder sent successfully for {reminder['name']} ({reminder['phone']})")
-                else:
-                    logger.error(f"Failed to send reminder for {reminder['name']} ({reminder['phone']})")
-            
-            # Save updated reminders back to JSON file
-            if reminders_to_send:
-                self._save_reminders(reminders)
-            
-        except Exception as e:
-            logger.error(f"Error checking reminders: {str(e)}")
-    
-    def _send_reminder_message(self, phone: str, name: str, meeting_datetime: datetime, meeting_link: str) -> bool:
-        """Send reminder message via AISensy"""
-        try:
-            if not phone:
-                logger.error("No phone number provided for reminder")
-                return False
-            
-            # Ensure phone number has + prefix
-            if not phone.startswith('+'):
-                phone = '+' + phone
-            
-            # Format meeting time
-            date = meeting_datetime.strftime("%Y-%m-%d")
-            time = meeting_datetime.strftime("%I:%M %p")
-            
-            # Create payload for AISensy
-            payload = {
-                "apiKey": AISENSY_API_KEY,
-                "campaignName": MEETING_REMINDER_CAMPAIGN,
-                "destination": phone,
-                "userName": "Skand",
-                "templateParams": [name, time, meeting_link]  # Only Name, Time, and Link for reminder
-            }
-            
-            logger.info(f"Sending meeting reminder to {phone} for {name}")
-            logger.info(f"Meeting details: Date: {date}, Time: {time}, Link: {meeting_link}")
-            
-            # Send reminder message
-            response = requests.post(AISENSY_URL, json=payload, timeout=30)
-            
-            if response.status_code == 200:
-                logger.info(f"Meeting reminder sent successfully to {phone}")
-                return True
-            else:
-                logger.error(f"Failed to send reminder to {phone}. Status: {response.status_code}, Response: {response.text}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error sending reminder to {phone}: {str(e)}")
-            return False
-    
-    def schedule_reminder(self, webhook_id: str, phone: str, name: str, meeting_datetime: datetime, meeting_link: str) -> bool:
-        """Schedule a reminder for a meeting"""
-        try:
-            reminders = self._load_reminders()
-            
-            # Check if reminder already exists for this webhook
-            for reminder in reminders:
-                if reminder.get('webhook_id') == webhook_id:
-                    logger.info(f"Reminder already exists for webhook {webhook_id}")
-                    return True
-            
-            # Create new reminder
-            new_reminder = {
-                "webhook_id": webhook_id,
-                "phone": phone,
-                "name": name,
-                "meeting_datetime": meeting_datetime.isoformat(),
-                "meeting_link": meeting_link,
-                "reminder_sent": False,
-                "created_at": datetime.now().isoformat()
-            }
-            
-            reminders.append(new_reminder)
-            self._save_reminders(reminders)
-            
-            logger.info(f"Reminder scheduled for {name} ({phone}) at {meeting_datetime}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error scheduling reminder: {str(e)}")
-            return False
-    
-    def _load_reminders(self):
-        """Load reminders from JSON file"""
-        try:
-            if not os.path.exists(REMINDERS_JSON_FILE):
-                return []
-            
-            with open(REMINDERS_JSON_FILE, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading reminders: {str(e)}")
-            return []
-    
-    def _save_reminders(self, reminders):
-        """Save reminders to JSON file"""
-        try:
-            with open(REMINDERS_JSON_FILE, 'w') as f:
-                json.dump(reminders, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving reminders: {str(e)}")
-
-# Initialize reminder scheduler
-reminder_scheduler = ReminderScheduler()
+# Reminder scheduling is now handled by separate reminder_scheduler.py
 
 app = Flask(__name__)
 
@@ -305,6 +111,44 @@ class MeetingConfirmation:
             logger.error(f"Error sending meeting confirmation to {phone}: {str(e)}")
             return False
     
+    def _schedule_reminder(self, webhook_id: str, phone: str, name: str, meeting_datetime: datetime, meeting_link: str) -> bool:
+        """Schedule a reminder by writing to JSON file (for background scheduler to pick up)"""
+        try:
+            # Load existing reminders
+            reminders = []
+            if os.path.exists(REMINDERS_JSON_FILE):
+                with open(REMINDERS_JSON_FILE, 'r') as f:
+                    reminders = json.load(f)
+            
+            # Check if reminder already exists for this webhook
+            for reminder in reminders:
+                if reminder.get('webhook_id') == webhook_id:
+                    logger.info(f"Reminder already exists for webhook {webhook_id}")
+                    return True
+            
+            # Create new reminder
+            new_reminder = {
+                "webhook_id": webhook_id,
+                "phone": phone,
+                "name": name,
+                "meeting_datetime": meeting_datetime.isoformat(),
+                "meeting_link": meeting_link,
+                "reminder_sent": False,
+                "created_at": datetime.now().isoformat()
+            }
+            
+            reminders.append(new_reminder)
+            
+            # Save reminders back to JSON file
+            with open(REMINDERS_JSON_FILE, 'w') as f:
+                json.dump(reminders, f, indent=2)
+            
+            logger.info(f"Reminder scheduled for {name} ({phone}) at {meeting_datetime}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error scheduling reminder: {str(e)}")
+            return False
 
 
     def extract_webhook_data(self, webhook_data: dict) -> dict:
@@ -545,10 +389,10 @@ class MeetingConfirmation:
             # Send meeting confirmation message
             confirmation_sent = self.send_confirmation_message(phone, name, date, time, meeting_link)
             
-            # Schedule reminder if meeting datetime is available
+            # Schedule reminder by writing to JSON file (for background scheduler to pick up)
             reminder_scheduled = False
             if meeting_datetime:
-                reminder_scheduled = reminder_scheduler.schedule_reminder(
+                reminder_scheduled = self._schedule_reminder(
                     webhook_id, phone, name, meeting_datetime, meeting_link
                 )
                 if reminder_scheduled:
@@ -681,7 +525,7 @@ def handle_confirmation_webhook():
 def root_info():
     """Root endpoint with service information"""
     return jsonify({
-        "service": "meeting_confirmation",
+        "service": "webhook_service",
         "status": "running",
         "endpoints": {
             "webhook": "POST / or POST /webhook or POST /confirmation/webhook",
@@ -690,13 +534,9 @@ def root_info():
             "test_webhook": "POST /confirmation/test-webhook",
             "debug_webhook": "POST /confirmation/debug-webhook",
             "print_webhook": "POST /confirmation/print-webhook",
-            "stats": "GET /confirmation/stats",
-            "reminder_start": "POST /reminder/start",
-            "reminder_stop": "POST /reminder/stop",
-            "reminder_status": "GET /reminder/status",
-            "reminder_test": "POST /reminder/test",
-            "reminder_list": "GET /reminder/list"
+            "stats": "GET /confirmation/stats"
         },
+        "note": "Reminder scheduling handled by separate reminder_scheduler.py",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -706,7 +546,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "service": "meeting_confirmation",
+        "service": "webhook_service",
         "processed_webhooks": len(confirmation_handler.processed_webhooks)
     })
 
@@ -880,136 +720,18 @@ def print_webhook_details():
         logger.error(f"Error in print webhook: {str(e)}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# Add reminder API endpoints
-@app.route('/reminder/start', methods=['POST'])
-def start_reminder_scheduler():
-    """Start the reminder scheduler"""
-    try:
-        reminder_scheduler.start_scheduler()
-        return jsonify({
-            "status": "success",
-            "message": "Reminder scheduler started successfully"
-        })
-    except Exception as e:
-        logger.error(f"Error starting reminder scheduler: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/reminder/stop', methods=['POST'])
-def stop_reminder_scheduler():
-    """Stop the reminder scheduler"""
-    try:
-        reminder_scheduler.stop_scheduler()
-        return jsonify({
-            "status": "success",
-            "message": "Reminder scheduler stopped successfully"
-        })
-    except Exception as e:
-        logger.error(f"Error stopping reminder scheduler: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/reminder/status', methods=['GET'])
-def get_reminder_status():
-    """Get reminder scheduler status and pending reminders"""
-    try:
-        reminders = reminder_scheduler._load_reminders()
-        
-        # Count pending and sent reminders
-        pending_count = sum(1 for r in reminders if not r.get('reminder_sent', False))
-        sent_count = sum(1 for r in reminders if r.get('reminder_sent', False))
-        
-        # Get next few pending reminders
-        pending_reminders = [r for r in reminders if not r.get('reminder_sent', False)]
-        pending_reminders.sort(key=lambda x: x.get('meeting_datetime', ''))
-        next_reminders = pending_reminders[:5]
-        
-        return jsonify({
-            "status": "success",
-            "scheduler_running": reminder_scheduler.is_running,
-            "pending_reminders": pending_count,
-            "sent_reminders": sent_count,
-            "next_reminders": [
-                {
-                    "name": r.get('name', 'Unknown'),
-                    "phone": r.get('phone', 'Unknown'),
-                    "meeting_datetime": r.get('meeting_datetime', 'Unknown'),
-                    "meeting_link": r.get('meeting_link', 'Unknown'),
-                    "created_at": r.get('created_at', 'Unknown')
-                } for r in next_reminders
-            ]
-        })
-        
-    except Exception as e:
-        logger.error(f"Error getting reminder status: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/reminder/test', methods=['POST'])
-def test_reminder():
-    """Test endpoint for sending reminder messages"""
-    try:
-        data = request.get_json()
-        phone = data.get('phone')
-        name = data.get('name', 'Test User')
-        meeting_datetime_str = data.get('meeting_datetime')
-        meeting_link = data.get('meeting_link', 'https://example.com/meeting')
-        
-        if not phone:
-            return jsonify({"status": "error", "message": "Phone number is required"}), 400
-        
-        if not meeting_datetime_str:
-            # Use a sample meeting time 2 hours from now
-            meeting_datetime = datetime.now() + timedelta(hours=2)
-        else:
-            meeting_datetime = datetime.fromisoformat(meeting_datetime_str)
-        
-        # Send test reminder
-        success = reminder_scheduler._send_reminder_message(phone, name, meeting_datetime, meeting_link)
-        
-        return jsonify({
-            "status": "success" if success else "failed",
-            "message": "Test reminder message sent" if success else "Failed to send test reminder",
-            "test_data": {
-                "phone": phone,
-                "name": name,
-                "meeting_datetime": meeting_datetime.isoformat(),
-                "meeting_link": meeting_link
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Error in test reminder endpoint: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/reminder/list', methods=['GET'])
-def list_all_reminders():
-    """List all reminders (both pending and sent)"""
-    try:
-        reminders = reminder_scheduler._load_reminders()
-        
-        return jsonify({
-            "status": "success",
-            "total_reminders": len(reminders),
-            "reminders": reminders
-        })
-        
-    except Exception as e:
-        logger.error(f"Error listing reminders: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+# Reminder endpoints removed - handled by separate reminder_scheduler.py
 
 if __name__ == '__main__':
-    logger.info("Starting Meeting Confirmation Service...")
+    logger.info("Starting Webhook Service...")
     logger.info(f"Campaign Name: {MEETING_CONFIRMATION_CAMPAIGN}")
-    logger.info(f"Reminder Campaign: {MEETING_REMINDER_CAMPAIGN}")
     logger.info(f"AISensy URL: {AISENSY_URL}")
-    
-    # Start reminder scheduler
-    reminder_scheduler.start_scheduler()
+    logger.info("Reminder scheduling handled by separate reminder_scheduler.py")
     
     try:
-        app.run(host='0.0.0.0', port=8002, debug=True)
+        app.run(host='0.0.0.0', port=8002, debug=False)
     except KeyboardInterrupt:
         logger.info("Received interrupt signal, shutting down...")
-        reminder_scheduler.stop_scheduler()
     except Exception as e:
-        logger.error(f"Fatal error in meeting confirmation service: {str(e)}")
-        reminder_scheduler.stop_scheduler()
+        logger.error(f"Fatal error in webhook service: {str(e)}")
         raise
